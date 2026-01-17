@@ -11,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"encore.dev"
 	"encore.dev/beta/errs"
 	"encore.dev/storage/sqldb"
 	"go.temporal.io/sdk/client"
@@ -89,7 +90,7 @@ func loadConfig() serviceConfig {
 		namespace = "default"
 	}
 
-	feePeriod := 30 * 24 * time.Hour
+	feePeriod := 5 * time.Minute
 	if raw := os.Getenv("FEE_PERIOD"); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil {
 			feePeriod = d
@@ -438,6 +439,55 @@ func ListBills(ctx context.Context, p *ListBillsParams) (*ListBillsResponse, err
 	return &ListBillsResponse{Bills: bills}, nil
 }
 
+type SeedResponse struct {
+	Bills []Bill `json:"bills"`
+}
+
+type seedItem struct {
+	Description string
+	AmountMinor int64
+	Currency    Currency
+}
+
+//encore:api public method=POST path=/dev/seed
+func Seed(ctx context.Context) (*SeedResponse, error) {
+	if encore.Meta().Environment.Cloud != encore.CloudLocal {
+		return nil, errs.B().Code(errs.PermissionDenied).Msg("seed only allowed in local env").Err()
+	}
+
+	now := time.Now().UTC()
+	itemsUSD := []seedItem{
+		{Description: "setup fee", AmountMinor: 1200, Currency: CurrencyUSD},
+		{Description: "monthly charge", AmountMinor: 5000, Currency: CurrencyUSD},
+	}
+	itemsGEL := []seedItem{
+		{Description: "service fee", AmountMinor: 900, Currency: CurrencyGEL},
+	}
+
+	openID, err := seedBill(ctx, BillOpen, now.Add(-2*time.Hour), now.Add(3*time.Hour), itemsUSD)
+	if err != nil {
+		return nil, err
+	}
+	closedID, err := seedBill(ctx, BillClosed, now.Add(-48*time.Hour), now.Add(-24*time.Hour), itemsGEL)
+	if err != nil {
+		return nil, err
+	}
+	chargedID, err := seedBill(ctx, BillCharged, now.Add(-72*time.Hour), now.Add(-48*time.Hour), append(itemsUSD, itemsGEL...))
+	if err != nil {
+		return nil, err
+	}
+
+	bills := make([]Bill, 0, 3)
+	for _, id := range []string{openID, closedID, chargedID} {
+		bill, err := fetchBill(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		bills = append(bills, *bill)
+	}
+	return &SeedResponse{Bills: bills}, nil
+}
+
 func fetchBill(ctx context.Context, billID string) (*Bill, error) {
 	var bill Bill
 	var totalsRaw []byte
@@ -584,6 +634,70 @@ func insertBillRecord(ctx context.Context, input BillingWorkflowInput) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func seedBill(ctx context.Context, status BillStatus, periodStart, periodEnd time.Time, items []seedItem) (string, error) {
+	billID, err := newUUID()
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC()
+
+	totals := map[string]int64{}
+	for _, item := range items {
+		totals[string(item.Currency)] += item.AmountMinor
+	}
+	totalsJSON, err := json.Marshal(totals)
+	if err != nil {
+		return "", err
+	}
+
+	var closedAt *time.Time
+	var chargedAt *time.Time
+	switch status {
+	case BillClosed:
+		closedAt = &now
+	case BillCharged:
+		closedAt = &now
+		chargedAt = &now
+	}
+
+	tx, err := billsDB.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO bills
+			(id, status, period_start, period_end, closed_at, charged_at, totals_by_currency,
+			 line_item_count, metadata, workflow_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	`, billID, status, periodStart, periodEnd, closedAt, chargedAt, totalsJSON,
+		len(items), nil, "seed", now, now)
+	if err != nil {
+		return "", err
+	}
+
+	for _, item := range items {
+		lineID, err := newUUID()
+		if err != nil {
+			return "", err
+		}
+		_, err = tx.Exec(ctx, `
+			INSERT INTO transaction_records
+				(id, bill_id, description, amount_minor, currency, metadata, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`, lineID, billID, item.Description, item.AmountMinor, item.Currency, nil, now)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return billID, nil
 }
 
 func badRequest(msg string) error {

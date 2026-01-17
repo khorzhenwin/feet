@@ -23,7 +23,7 @@ config/env.example
 Key vars:
 - `TEMPORAL_ADDRESS` (default `localhost:7233`)
 - `TEMPORAL_NAMESPACE` (default `default`)
-- `FEE_PERIOD` (duration string, e.g. `10s` for testing)
+- `FEE_PERIOD` (duration string, e.g. `5m` for testing)
 
 ### Start infra + app
 ```
@@ -51,18 +51,29 @@ make all
 - `POST /bills/:bill_id/close` manually close a bill
 - `GET /bills/:bill_id` fetch bill details
 - `GET /bills?status=open|closed|charged` list bills
+- `POST /dev/seed` seed sample bills in local env
+
+## Hot Commands
+```
+make seed
+```
 
 ## Architecture Diagram
 ```mermaid
 flowchart TD
-  Client[Client / Other Services] -->|REST| FeesAPI[Fees Service (Encore)]
+  Client[Client / Other Services] -->|REST| FeesAPI[Fees Service]
   FeesAPI -->|SQL| FeesDB[(Fees Postgres)]
   FeesAPI -->|Start Workflow| Temporal[Temporal Server]
-  Temporal -->|Activity: create bill| FeesDB
-  Temporal -->|Timer: FEE_PERIOD| Temporal
-  Temporal -->|Activity: close bill| FeesDB
-  FeesAPI -->|Signal: bill-closed| Temporal
+  Temporal -->|Create Bill Activity| FeesDB
+  Temporal -->|Timer FEE_PERIOD| Temporal
+  Temporal -->|Close Bill Activity| FeesDB
+  FeesAPI -->|Signal bill-closed| Temporal
 ```
+
+## Diagrams
+![Encore overview](resources/encore.png)
+![Temporal UI](resources/temporal_ui.png)
+![Temporal workflow](resources/temporal_workflow.png)
 
 ## E2E Tests
 Run end-to-end tests against a running instance:
@@ -82,4 +93,7 @@ make all
 make infra-up
 make infra-down
 make test
+make seed
 ```
+
+## POC

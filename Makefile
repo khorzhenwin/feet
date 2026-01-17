@@ -1,4 +1,4 @@
-.PHONY: all down infra-up infra-down infra-logs dev e2e test
+.PHONY: all down infra-up infra-down infra-logs dev e2e test seed
 
 ENV_FILE ?= config/env.example
 
@@ -28,3 +28,6 @@ e2e:
 
 test:
 	encore test ./...
+
+seed:
+	curl -s -X POST http://localhost:4000/dev/seed | cat

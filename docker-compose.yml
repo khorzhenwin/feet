@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: fees-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: fees
+      POSTGRES_PASSWORD: fees
+      POSTGRES_DB: fees
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  temporal-postgres:
+    image: postgres:16
+    container_name: temporal-postgres
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - temporal_postgres_data:/var/lib/postgresql/data
+
+  temporal:
+    image: temporalio/auto-setup:1.25.0
+    container_name: temporal
+    depends_on:
+      - temporal-postgres
+    ports:
+      - "7233:7233"
+    environment:
+      DB: postgres12
+      POSTGRES_SEEDS: temporal-postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_DB: temporal
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    container_name: temporal-ui
+    depends_on:
+      - temporal
+    ports:
+      - "8080:8080"
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+
+volumes:
+  postgres_data:
+  temporal_postgres_data:

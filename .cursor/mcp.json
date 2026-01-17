@@ -1,0 +1,12 @@
+{
+    "mcpServers": {
+        "encore-mcp": {
+            "args": [
+                "mcp",
+                "run",
+                "--app=feet-sk9i"
+            ],
+            "command": "encore"
+        }
+    }
+}

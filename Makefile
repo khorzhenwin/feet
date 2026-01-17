@@ -1,8 +1,15 @@
 .PHONY: all down infra-up infra-down infra-logs dev e2e test seed
 
 ENV_FILE ?= config/env.example
+SEED_WAIT ?= 10
 
-all: dev
+all: infra-up
+	@set -a; \
+	if [ -f "$(ENV_FILE)" ]; then . "$(ENV_FILE)"; fi; \
+	set +a; \
+	encore run &
+	@sleep $(SEED_WAIT)
+	@$(MAKE) seed
 
 down:
 	pkill -f "encore run" || true

@@ -3,12 +3,14 @@ package fees
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"encore.dev"
@@ -146,6 +148,7 @@ type Bill struct {
 	LineItemCount    int              `json:"line_item_count"`
 	Metadata         json.RawMessage  `json:"metadata,omitempty"`
 	WorkflowID       string           `json:"workflow_id"`
+	IdempotencyKey   *string          `json:"idempotency_key,omitempty"`
 	CreatedAt        time.Time        `json:"created_at"`
 	UpdatedAt        time.Time        `json:"updated_at"`
 }
@@ -160,10 +163,19 @@ type TransactionRecord struct {
 	CreatedAt   time.Time       `json:"created_at"`
 }
 
+type BillDetail struct {
+	ID        string              `json:"id"`
+	Status    BillStatus          `json:"status"`
+	Bill      Bill                `json:"bill"`
+	LineItems []TransactionRecord `json:"line_items"`
+}
+
 type CreateBillParams struct {
-	PeriodStart *time.Time      `json:"period_start,omitempty"`
-	PeriodEnd   *time.Time      `json:"period_end,omitempty"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
+	BillID         string          `json:"bill_id,omitempty"`
+	PeriodStart    *time.Time      `json:"period_start,omitempty"`
+	PeriodEnd      *time.Time      `json:"period_end,omitempty"`
+	Metadata       json.RawMessage `json:"metadata,omitempty"`
+	IdempotencyKey string          `header:"Idempotency-Key"`
 }
 
 type CreateBillResponse struct {
@@ -185,23 +197,60 @@ func (s *Service) CreateBill(ctx context.Context, p *CreateBillParams) (*CreateB
 		periodEnd = p.PeriodEnd.UTC()
 	}
 
-	billID, err := newUUID()
-	if err != nil {
-		return nil, errs.Wrap(err, "generate bill id")
+	var billID string
+	if p != nil && p.BillID != "" {
+		if !isUUID(p.BillID) {
+			return nil, badRequest("bill_id must be a UUID")
+		}
+		billID = p.BillID
+	} else {
+		var err error
+		billID, err = newUUID()
+		if err != nil {
+			return nil, errs.Wrap(err, "generate bill id")
+		}
 	}
 	workflowID := fmt.Sprintf("bill-%s", billID)
 
 	var metadata json.RawMessage
+	var idempotencyKey string
 	if p != nil {
 		metadata = p.Metadata
+		idempotencyKey = p.IdempotencyKey
 	}
 
 	input := BillingWorkflowInput{
-		BillID:      billID,
-		WorkflowID:  workflowID,
-		PeriodStart: periodStart,
-		PeriodEnd:   periodEnd,
-		Metadata:    metadata,
+		BillID:         billID,
+		WorkflowID:     workflowID,
+		PeriodStart:    periodStart,
+		PeriodEnd:      periodEnd,
+		Metadata:       metadata,
+		IdempotencyKey: idempotencyKey,
+	}
+
+	if idempotencyKey != "" {
+		existing, err := fetchBillByIdempotencyKey(ctx, idempotencyKey)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			return &CreateBillResponse{
+				Bill:       *existing,
+				WorkflowID: existing.WorkflowID,
+				RunID:      "",
+			}, nil
+		}
+	}
+
+	if p != nil && p.BillID != "" {
+		existing, err := fetchBill(ctx, billID)
+		if err == nil && existing != nil {
+			return &CreateBillResponse{
+				Bill:       *existing,
+				WorkflowID: existing.WorkflowID,
+				RunID:      "",
+			}, nil
+		}
 	}
 
 	if err := insertBillRecord(ctx, input); err != nil {
@@ -226,6 +275,7 @@ func (s *Service) CreateBill(ctx context.Context, p *CreateBillParams) (*CreateB
 		LineItemCount:    0,
 		Metadata:         metadata,
 		WorkflowID:       workflowID,
+		IdempotencyKey:   stringPtrOrNil(idempotencyKey),
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
@@ -364,17 +414,48 @@ func (s *Service) CloseBill(ctx context.Context, bill_id string) (*CloseBillResp
 	return &CloseBillResponse{Bill: bill}, nil
 }
 
+type ChargeBillResponse struct {
+	Bill Bill `json:"bill"`
+}
+
+//encore:api public method=POST path=/bills/:bill_id/charge
+func (s *Service) ChargeBill(ctx context.Context, bill_id string) (*ChargeBillResponse, error) {
+	bill, alreadyCharged, err := chargeBill(ctx, bill_id)
+	if err != nil {
+		return nil, err
+	}
+	if !alreadyCharged && bill.WorkflowID != "" {
+		if err := s.temporal.SignalWorkflow(ctx, bill.WorkflowID, "", closeSignalName, CloseSignal{Reason: "charged"}); err != nil {
+			log.Printf("fees: failed to signal workflow %s: %v", bill.WorkflowID, err)
+		}
+	}
+	return &ChargeBillResponse{Bill: bill}, nil
+}
+
 //encore:api public method=GET path=/bills/:bill_id
-func GetBill(ctx context.Context, bill_id string) (*Bill, error) {
+func GetBill(ctx context.Context, bill_id string) (*BillDetail, error) {
 	bill, err := fetchBill(ctx, bill_id)
 	if err != nil {
 		return nil, err
 	}
-	return bill, nil
+	items, err := listTransactionRecords(ctx, bill_id)
+	if err != nil {
+		return nil, err
+	}
+	return &BillDetail{
+		ID:        bill.ID,
+		Status:    bill.Status,
+		Bill:      *bill,
+		LineItems: items,
+	}, nil
 }
 
 type ListBillsParams struct {
-	Status string `query:"status"`
+	Status string    `query:"status"`
+	From   time.Time `query:"from"`
+	To     time.Time `query:"to"`
+	Limit  int       `query:"limit"`
+	Offset int       `query:"offset"`
 }
 
 type ListBillsResponse struct {
@@ -385,19 +466,42 @@ type ListBillsResponse struct {
 func ListBills(ctx context.Context, p *ListBillsParams) (*ListBillsResponse, error) {
 	query := `
 		SELECT id, status, period_start, period_end, closed_at, charged_at,
-			   totals_by_currency, line_item_count, metadata, workflow_id, created_at, updated_at
+			   totals_by_currency, line_item_count, metadata, workflow_id, idempotency_key, created_at, updated_at
 		FROM bills
 	`
 	var args []interface{}
+	var filters []string
 	if p != nil && p.Status != "" {
 		status := BillStatus(p.Status)
 		if status != BillOpen && status != BillClosed && status != BillCharged {
 			return nil, badRequest("invalid status")
 		}
-		query += " WHERE status = $1"
+		filters = append(filters, fmt.Sprintf("status = $%d", len(args)+1))
 		args = append(args, status)
 	}
+	if p != nil && !p.From.IsZero() {
+		filters = append(filters, fmt.Sprintf("created_at >= $%d", len(args)+1))
+		args = append(args, p.From.UTC())
+	}
+	if p != nil && !p.To.IsZero() {
+		filters = append(filters, fmt.Sprintf("created_at <= $%d", len(args)+1))
+		args = append(args, p.To.UTC())
+	}
+	if len(filters) > 0 {
+		query += " WHERE " + strings.Join(filters, " AND ")
+	}
 	query += " ORDER BY created_at DESC"
+
+	limit := 50
+	offset := 0
+	if p != nil && p.Limit > 0 {
+		limit = p.Limit
+	}
+	if p != nil && p.Offset > 0 {
+		offset = p.Offset
+	}
+	query += fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+	args = append(args, limit, offset)
 
 	rows, err := billsDB.Query(ctx, query, args...)
 	if err != nil {
@@ -409,6 +513,7 @@ func ListBills(ctx context.Context, p *ListBillsParams) (*ListBillsResponse, err
 	for rows.Next() {
 		var bill Bill
 		var totalsRaw []byte
+		var idempotencyKey sql.NullString
 		if err := rows.Scan(
 			&bill.ID,
 			&bill.Status,
@@ -420,11 +525,13 @@ func ListBills(ctx context.Context, p *ListBillsParams) (*ListBillsResponse, err
 			&bill.LineItemCount,
 			&bill.Metadata,
 			&bill.WorkflowID,
+			&idempotencyKey,
 			&bill.CreatedAt,
 			&bill.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
+		bill.IdempotencyKey = nullStringPtr(idempotencyKey)
 		bill.TotalsByCurrency = map[string]int64{}
 		if len(totalsRaw) > 0 {
 			if err := json.Unmarshal(totalsRaw, &bill.TotalsByCurrency); err != nil {
@@ -491,9 +598,10 @@ func Seed(ctx context.Context) (*SeedResponse, error) {
 func fetchBill(ctx context.Context, billID string) (*Bill, error) {
 	var bill Bill
 	var totalsRaw []byte
+	var idempotencyKey sql.NullString
 	err := billsDB.QueryRow(ctx, `
 		SELECT id, status, period_start, period_end, closed_at, charged_at,
-			   totals_by_currency, line_item_count, metadata, workflow_id, created_at, updated_at
+			   totals_by_currency, line_item_count, metadata, workflow_id, idempotency_key, created_at, updated_at
 		FROM bills
 		WHERE id = $1
 	`, billID).Scan(
@@ -507,6 +615,7 @@ func fetchBill(ctx context.Context, billID string) (*Bill, error) {
 		&bill.LineItemCount,
 		&bill.Metadata,
 		&bill.WorkflowID,
+		&idempotencyKey,
 		&bill.CreatedAt,
 		&bill.UpdatedAt,
 	)
@@ -516,6 +625,7 @@ func fetchBill(ctx context.Context, billID string) (*Bill, error) {
 		}
 		return nil, err
 	}
+	bill.IdempotencyKey = nullStringPtr(idempotencyKey)
 	bill.TotalsByCurrency = map[string]int64{}
 	if len(totalsRaw) > 0 {
 		if err := json.Unmarshal(totalsRaw, &bill.TotalsByCurrency); err != nil {
@@ -523,6 +633,40 @@ func fetchBill(ctx context.Context, billID string) (*Bill, error) {
 		}
 	}
 	return &bill, nil
+}
+
+func listTransactionRecords(ctx context.Context, billID string) ([]TransactionRecord, error) {
+	rows, err := billsDB.Query(ctx, `
+		SELECT id, bill_id, description, amount_minor, currency, metadata, created_at
+		FROM transaction_records
+		WHERE bill_id = $1
+		ORDER BY created_at ASC
+	`, billID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []TransactionRecord
+	for rows.Next() {
+		var item TransactionRecord
+		if err := rows.Scan(
+			&item.ID,
+			&item.BillID,
+			&item.Description,
+			&item.AmountMinor,
+			&item.Currency,
+			&item.Metadata,
+			&item.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 func closeBill(ctx context.Context, billID string) (Bill, bool, error) {
@@ -534,9 +678,10 @@ func closeBill(ctx context.Context, billID string) (Bill, bool, error) {
 
 	var bill Bill
 	var totalsRaw []byte
+	var idempotencyKey sql.NullString
 	err = tx.QueryRow(ctx, `
 		SELECT id, status, period_start, period_end, closed_at, charged_at,
-			   totals_by_currency, line_item_count, metadata, workflow_id, created_at, updated_at
+			   totals_by_currency, line_item_count, metadata, workflow_id, idempotency_key, created_at, updated_at
 		FROM bills
 		WHERE id = $1
 		FOR UPDATE
@@ -551,6 +696,7 @@ func closeBill(ctx context.Context, billID string) (Bill, bool, error) {
 		&bill.LineItemCount,
 		&bill.Metadata,
 		&bill.WorkflowID,
+		&idempotencyKey,
 		&bill.CreatedAt,
 		&bill.UpdatedAt,
 	)
@@ -560,6 +706,7 @@ func closeBill(ctx context.Context, billID string) (Bill, bool, error) {
 		}
 		return Bill{}, false, err
 	}
+	bill.IdempotencyKey = nullStringPtr(idempotencyKey)
 
 	bill.TotalsByCurrency = map[string]int64{}
 	if len(totalsRaw) > 0 {
@@ -625,11 +772,11 @@ func insertBillRecord(ctx context.Context, input BillingWorkflowInput) error {
 	_, err = tx.Exec(ctx, `
 		INSERT INTO bills
 			(id, status, period_start, period_end, totals_by_currency,
-			 line_item_count, metadata, workflow_id, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			 line_item_count, metadata, workflow_id, idempotency_key, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (id) DO NOTHING
 	`, input.BillID, BillOpen, input.PeriodStart, input.PeriodEnd, []byte("{}"),
-		0, input.Metadata, input.WorkflowID, now, now)
+		0, input.Metadata, input.WorkflowID, nullIfEmpty(input.IdempotencyKey), now, now)
 	if err != nil {
 		return err
 	}
@@ -671,10 +818,10 @@ func seedBill(ctx context.Context, status BillStatus, periodStart, periodEnd tim
 	_, err = tx.Exec(ctx, `
 		INSERT INTO bills
 			(id, status, period_start, period_end, closed_at, charged_at, totals_by_currency,
-			 line_item_count, metadata, workflow_id, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			 line_item_count, metadata, workflow_id, idempotency_key, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`, billID, status, periodStart, periodEnd, closedAt, chargedAt, totalsJSON,
-		len(items), nil, "seed", now, now)
+		len(items), nil, "seed", nil, now, now)
 	if err != nil {
 		return "", err
 	}
@@ -723,4 +870,173 @@ func newUUID() (string, error) {
 		hexStr[16:20],
 		hexStr[20:32],
 	), nil
+}
+
+func fetchBillByIdempotencyKey(ctx context.Context, key string) (*Bill, error) {
+	if key == "" {
+		return nil, nil
+	}
+	var bill Bill
+	var totalsRaw []byte
+	var idempotencyKey sql.NullString
+	err := billsDB.QueryRow(ctx, `
+		SELECT id, status, period_start, period_end, closed_at, charged_at,
+			   totals_by_currency, line_item_count, metadata, workflow_id, idempotency_key, created_at, updated_at
+		FROM bills
+		WHERE idempotency_key = $1
+	`, key).Scan(
+		&bill.ID,
+		&bill.Status,
+		&bill.PeriodStart,
+		&bill.PeriodEnd,
+		&bill.ClosedAt,
+		&bill.ChargedAt,
+		&totalsRaw,
+		&bill.LineItemCount,
+		&bill.Metadata,
+		&bill.WorkflowID,
+		&idempotencyKey,
+		&bill.CreatedAt,
+		&bill.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sqldb.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	bill.TotalsByCurrency = map[string]int64{}
+	bill.IdempotencyKey = nullStringPtr(idempotencyKey)
+	if len(totalsRaw) > 0 {
+		if err := json.Unmarshal(totalsRaw, &bill.TotalsByCurrency); err != nil {
+			return nil, err
+		}
+	}
+	return &bill, nil
+}
+
+func chargeBill(ctx context.Context, billID string) (Bill, bool, error) {
+	tx, err := billsDB.Begin(ctx)
+	if err != nil {
+		return Bill{}, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var bill Bill
+	var totalsRaw []byte
+	var idempotencyKey sql.NullString
+	err = tx.QueryRow(ctx, `
+		SELECT id, status, period_start, period_end, closed_at, charged_at,
+			   totals_by_currency, line_item_count, metadata, workflow_id, idempotency_key, created_at, updated_at
+		FROM bills
+		WHERE id = $1
+		FOR UPDATE
+	`, billID).Scan(
+		&bill.ID,
+		&bill.Status,
+		&bill.PeriodStart,
+		&bill.PeriodEnd,
+		&bill.ClosedAt,
+		&bill.ChargedAt,
+		&totalsRaw,
+		&bill.LineItemCount,
+		&bill.Metadata,
+		&bill.WorkflowID,
+		&idempotencyKey,
+		&bill.CreatedAt,
+		&bill.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sqldb.ErrNoRows) {
+			return Bill{}, false, notFound("bill not found")
+		}
+		return Bill{}, false, err
+	}
+
+	bill.TotalsByCurrency = map[string]int64{}
+	bill.IdempotencyKey = nullStringPtr(idempotencyKey)
+	if len(totalsRaw) > 0 {
+		if err := json.Unmarshal(totalsRaw, &bill.TotalsByCurrency); err != nil {
+			return Bill{}, false, err
+		}
+	}
+
+	if bill.Status == BillCharged {
+		if err := tx.Commit(); err != nil {
+			return Bill{}, false, err
+		}
+		return bill, true, nil
+	}
+
+	now := time.Now().UTC()
+	if bill.Status == BillOpen {
+		bill.Status = BillClosed
+		bill.ClosedAt = &now
+	}
+	bill.Status = BillCharged
+	bill.ChargedAt = &now
+	bill.UpdatedAt = now
+
+	_, err = tx.Exec(ctx, `
+		UPDATE bills
+		SET status = $1,
+			closed_at = $2,
+			charged_at = $3,
+			updated_at = $4
+		WHERE id = $5
+	`, bill.Status, bill.ClosedAt, bill.ChargedAt, bill.UpdatedAt, bill.ID)
+	if err != nil {
+		return Bill{}, false, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Bill{}, false, err
+	}
+	return bill, false, nil
+}
+
+func nullIfEmpty(value string) interface{} {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func isUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i, ch := range value {
+		switch i {
+		case 8, 13, 18, 23:
+			if ch != '-' {
+				return false
+			}
+		default:
+			if !isHex(ch) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isHex(ch rune) bool {
+	return (ch >= '0' && ch <= '9') ||
+		(ch >= 'a' && ch <= 'f') ||
+		(ch >= 'A' && ch <= 'F')
+}
+
+func nullStringPtr(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	return &value.String
+}
+
+func stringPtrOrNil(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
 }

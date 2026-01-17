@@ -98,6 +98,41 @@ func TestCloseBillIdempotent(t *testing.T) {
 	}
 }
 
+func TestChargeBillFromOpen(t *testing.T) {
+	ctx := context.Background()
+	resetDB(t, ctx)
+
+	billID := newBillID(t)
+	now := time.Now().UTC()
+	insertBill(t, ctx, billID, BillOpen, now, now.Add(24*time.Hour))
+
+	bill, alreadyCharged, err := chargeBill(ctx, billID)
+	if err != nil {
+		t.Fatalf("charge bill failed: %v", err)
+	}
+	if alreadyCharged {
+		t.Fatalf("expected not already charged on first call")
+	}
+	if bill.Status != BillCharged {
+		t.Fatalf("expected bill charged status")
+	}
+	if bill.ClosedAt == nil || bill.ChargedAt == nil {
+		t.Fatalf("expected closed_at and charged_at to be set")
+	}
+}
+
+func TestIsUUID(t *testing.T) {
+	valid := "a0e2015d-cb2b-49b3-b789-96bc2bc6124s"
+	if isUUID(valid) {
+		t.Fatalf("expected invalid UUID for %s", valid)
+	}
+
+	valid = "a0e2015d-cb2b-49b3-b789-96bc2bc61245"
+	if !isUUID(valid) {
+		t.Fatalf("expected valid UUID for %s", valid)
+	}
+}
+
 func resetDB(t *testing.T, ctx context.Context) {
 	t.Helper()
 	if _, err := billsDB.Exec(ctx, `DELETE FROM transaction_records`); err != nil {

@@ -11,11 +11,12 @@ import (
 )
 
 type BillingWorkflowInput struct {
-	BillID      string
-	WorkflowID  string
-	PeriodStart time.Time
-	PeriodEnd   time.Time
-	Metadata    json.RawMessage
+	BillID         string
+	WorkflowID     string
+	PeriodStart    time.Time
+	PeriodEnd      time.Time
+	Metadata       json.RawMessage
+	IdempotencyKey string
 }
 
 type CloseSignal struct {

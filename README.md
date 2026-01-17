@@ -49,8 +49,9 @@ make all
 - `POST /bills` create a bill and start the workflow
 - `POST /bills/:bill_id/line-items` add a line item
 - `POST /bills/:bill_id/close` manually close a bill
+- `POST /bills/:bill_id/charge` charge a bill
 - `GET /bills/:bill_id` fetch bill details
-- `GET /bills?status=open|closed|charged` list bills
+- `GET /bills?status=open|closed|charged&from=...&to=...&limit=...&offset=...` list bills
 - `POST /dev/seed` seed sample bills in local env
 
 ## Hot Commands
@@ -74,6 +75,7 @@ flowchart TD
 ![Encore overview](resources/encore.png)
 ![Temporal UI](resources/temporal_ui.png)
 ![Temporal workflow](resources/temporal_workflow.png)
+![Temporal workflow 2](resources/temporal_workflow_2.png)
 
 ## E2E Tests
 Run end-to-end tests against a running instance:
@@ -90,10 +92,9 @@ The script expects:
 ## Other Commands
 ```
 make all
+make down
 make infra-up
 make infra-down
 make test
 make seed
 ```
-
-## POC
